@@ -9,6 +9,16 @@
 #include <ArduinoJson.h>
 #include "website.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+uint8_t temprature_sens_read();
+//uint8_t g_phyFuns;
+
+#ifdef __cplusplus
+}
+#endif
 
 struct measure {
   float avg = 0;
@@ -130,6 +140,11 @@ bool writeToFlash(int* address, String* str, String* current, bool write){
     *address = *address + str->length() + 1 ;
     return true;
   }
+  else if (write){
+    EEPROM.writeString(*address,*current);
+    *address = *address + current->length() + 1;
+    return true;
+  }
   else  {
     *address = *address + current->length() + 1;
     return write;
@@ -172,8 +187,9 @@ void writeMemory(String *req){
 }
 
 void setup() {
-  Serial.begin(9600);
-  if(!EEPROM.begin(64)){
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  if(!EEPROM.begin(256)){
     Serial.println("Error initializing eeprom!");
     Serial.println("Restarting...");
     ESP.restart();
@@ -186,8 +202,10 @@ void setup() {
   if(ssid.length() > 1 && pass.length() > 1){
     WiFi.begin(ssid.c_str(),pass.c_str());
     for(int i = 0; i < 15; i++){
-      if(WiFi.status() != WL_CONNECTED){
-        WiFi.mode(WIFI_STA);
+      if(WiFi.waitForConnectResult() != WL_CONNECTED){
+        WiFi.disconnect();
+        delay(10);
+        Serial.printf("WifiStatus: %i ", WiFi.status());
         WiFi.begin(ssid.c_str(),pass.c_str());
         Serial.println("Connecting...");
         delay(1000);
@@ -262,6 +280,11 @@ void handleHttpClient(WiFiClient* client){
           client->print(header);
           client->print(root);
         }
+        else if(req.substring(0, 12) == "GET /signal "){
+          client->print(header);
+          client->print(WiFi.RSSI());
+          Serial.println(WiFi.RSSI());
+        }
         else if(req.substring(0, 13) == "POST /submit "){
           Serial.println("requested submit");
 
@@ -269,7 +292,6 @@ void handleHttpClient(WiFiClient* client){
           client->print(root);
 
           writeMemory(&req);
-          readMemory();
 
           Serial.println("Restarting...");
           WiFi.disconnect();
@@ -336,8 +358,21 @@ void makeJson(data* d){
       doc[i]["h"]["ma"] = d->humidity.max;
       doc[i]["h"]["mi"] = d->humidity.min;
     }
+    else{
+      doc[i] = serialized("{}");
+    }
   }
   serializeJson(doc,outputBuffer,256);
+}
+
+void publish(char* subtopic){
+  topic.toCharArray(topic_c,128);
+  sprintf(topic_c, "%s/%s", topic.c_str(), subtopic);
+  mqttClient.publish(topic_c, outputBuffer);
+}
+
+double getMemUsage(){
+  return (double)ESP.getFreeHeap()/(double)ESP.getHeapSize();
 }
 
 void loop() {
@@ -374,7 +409,10 @@ void loop() {
             stat(d, temp, humid);
             makeJson(d);
 
-            mqttClient.publish(topic_c, outputBuffer);
+            publish((char*)"data");
+
+            sprintf(outputBuffer, "{\"rssi\": %d,\"heap\": %f, \"temp\": %f}", WiFi.RSSI(),getMemUsage(), temperatureRead());
+            publish((char*)"diag");
           }
         }
       }
