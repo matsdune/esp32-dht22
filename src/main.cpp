@@ -33,13 +33,16 @@ struct data
 
 
 int state = 0; // 0 = initial mode - no wifi connection, 1 = AP mode - connected, 2 = client mode - connected
+int failedReads = 0;
 String ssid = "";
 String pass = "";
 String server = "";
 String topic = "";
 String mqttuser = "";
 String mqttpass = "";
-char outputBuffer[256];
+int interval = 5;   // data transmission intervall, in seconds
+#define OUTPUTBUFFERSIZE 256
+char outputBuffer[OUTPUTBUFFERSIZE];
 
 const int capacity = JSON_ARRAY_SIZE(3) + 3*JSON_OBJECT_SIZE(2) + 6*JSON_OBJECT_SIZE(3);
 StaticJsonDocument<capacity> doc;
@@ -47,6 +50,8 @@ StaticJsonDocument<capacity> doc;
 float temp[3][10] = {{0,0,0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0,0,0}};
 float humid[3][10] = {{0,0,0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0,0,0},{0,0,0,0,0,0,0,0,0,0}};
 bool dhtActive[3] = {false,false,false};
+bool dhtFailedRead[3] = {false,false,false};
+long dhtReReadTime = 0;
 int dataIndex = 0;
 #define DATALENGTH 10
 #define DHTSENSORS 3
@@ -61,7 +66,7 @@ char server_c[64] = "";
 char topic_c[128] = "";
 int port = 1883;
 long lastReconnectAttempt = 0;
-long lastDataSendEvent = 0;
+long lastDataReadEvent = 0;
 
 
 WiFiServer httpserver(80);
@@ -69,6 +74,13 @@ WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 DHT dht[] = {{DHTDATAPIN1, DHT22},{DHTDATAPIN2, DHT22},{DHTDATAPIN3, DHT22}};
 
+// declare functions
+void publish(char* subtopic);
+void publish(char* subtopic, bool sendError);
+bool mqttReconnect();
+
+
+// define functions
 void readMemory(){
   int address = 0;
   Serial.println("FLASH MEMORY DATA");
@@ -102,6 +114,14 @@ void readMemory(){
   mqttpass = EEPROM.readString(address);
   address = address + mqttpass.length() + 1;
   Serial.println(mqttpass);
+  
+  Serial.print("Interval: ");
+  interval = EEPROM.readInt(address);
+  if(interval < 0){
+    interval = 5;
+  }
+  address = address + sizeof interval;
+  Serial.println(interval);
   Serial.println();
 }
 
@@ -151,6 +171,18 @@ bool writeToFlash(int* address, String* str, String* current, bool write){
   }
 }
 
+bool writeToFlash(int* address, int* value, int* current, bool write){
+  Serial.printf("Writing int: %i\n", *value);
+  if (write || *value != *current){
+    *address = *address + EEPROM.writeInt(*address,*value);
+    return true;
+  }
+  else  {
+    *address = *address + 4;
+    return write;
+  }
+}
+
 void writeMemory(String *req){
   String _ssid = getFormParam("ssid", req);
   String _pass = getFormParam("password", req);
@@ -158,6 +190,7 @@ void writeMemory(String *req){
   String _topic = getFormParam("topic", req);
   String _mqttuser = getFormParam("mqttuser", req);
   String _mqttpass = getFormParam("mqttpass", req);
+  int _interval = getFormParam("interval", req).toInt();
 
   //save to flash
   int address = 0;
@@ -169,21 +202,19 @@ void writeMemory(String *req){
   write = writeToFlash(&address, &_topic, &topic, write);
   write = writeToFlash(&address, &_mqttuser, &mqttuser, write);
   write = writeToFlash(&address, &_mqttpass, &mqttpass, write);
+  write = writeToFlash(&address, &_interval, &interval, write);
+  
+  Serial.printf("max Address: %i\n", address);
 
   EEPROM.commit();
 
-  Serial.print("ssid: ");
-  Serial.println(_ssid);
-  Serial.print("pass: ");
-  Serial.println(_pass);
-  Serial.print("server: ");
-  Serial.println(_server);
-  Serial.print("topic: ");
-  Serial.println(_topic);
-  Serial.print("mqtt user: ");
-  Serial.println(_mqttuser);
-  Serial.print("mqtt pass: ");
-  Serial.println(_mqttpass);
+  Serial.printf("ssid: %s\n",_ssid.c_str());
+  Serial.printf("pass: %s\n",_pass.c_str());
+  Serial.printf("server: %s\n",_server.c_str());
+  Serial.printf("topic: %s\n",_topic.c_str());
+  Serial.printf("mqtt user: %s\n",_mqttuser.c_str());
+  Serial.printf("mqtt pass: %s\n",_mqttpass.c_str());
+  Serial.printf("interval: %i\n",_interval);
 }
 
 void setup() {
@@ -216,10 +247,17 @@ void setup() {
         Serial.println(WiFi.localIP());
         int s = server.lastIndexOf(':');
 
+        if(mqttClient.setBufferSize(320))
+          Serial.println("MQTT client buffer increased");
+        else
+          Serial.println("MQTT client buffer increase failed");
+
         server.substring(0,s).toCharArray(server_c,64);
         topic.toCharArray(topic_c,128);
         port = server.substring(s+1).toInt();
         mqttClient.setServer(server_c, port);
+        mqttReconnect();
+
         pinMode(DHTDATAPIN1, INPUT);
         pinMode(DHTDATAPIN2, INPUT);
         pinMode(DHTDATAPIN3, INPUT);
@@ -235,6 +273,10 @@ void setup() {
           Serial.println(dhtActive[i]);
         }
 
+        if(mqttClient.connected()){
+          sprintf(outputBuffer, "{\"info\": \"Device startup, sensor status:  1: %s, 2: %s, 3: %s\"}", dhtActive[0] ? "ok" : "n/c", dhtActive[1] ? "ok" : "n/c",dhtActive[2] ? "ok" : "n/c");
+          publish((char*)"diag");
+        }
         i = 15;
         state = 2;
       }
@@ -270,6 +312,10 @@ void setup() {
   }
 }
 
+double getMemUsage(){
+  return (double)ESP.getFreeHeap()/(double)ESP.getHeapSize();
+}
+
 void handleHttpClient(WiFiClient* client){
   if(client->connected()){
         String req = client->readString();
@@ -285,6 +331,10 @@ void handleHttpClient(WiFiClient* client){
           client->print(WiFi.RSSI());
           Serial.println(WiFi.RSSI());
         }
+        else if(req.substring(0, 13) == "GET /restart "){
+          client->print(noContent);
+          ESP.restart();
+        }
         else if(req.substring(0, 13) == "POST /submit "){
           Serial.println("requested submit");
 
@@ -292,6 +342,9 @@ void handleHttpClient(WiFiClient* client){
           client->print(root);
 
           writeMemory(&req);
+
+          client->stop();
+          delay(1000);
 
           Serial.println("Restarting...");
           WiFi.disconnect();
@@ -309,6 +362,11 @@ bool mqttReconnect(){
   // Attempt to connect
   if (mqttClient.connect(clientId.c_str(),mqttuser.c_str(),mqttpass.c_str())) {
     Serial.println("connected");
+    
+    //topic.toCharArray(topic_c,128);
+    //sprintf(topic_c, "%s/%s", topic.c_str(), "debug");
+    //Serial.println(mqttClient.subscribe("debug"));
+  
   } else {
     Serial.print("failed, rc=");
     Serial.print(mqttClient.state());
@@ -329,6 +387,8 @@ void stat(data d[DHTSENSORS], float (&tempArray)[3][10], float (&humidArray)[3][
       d[i].humidity.avg = humidArray[i][0];
       d[i].humidity.max = humidArray[i][0];
       d[i].humidity.min = humidArray[i][0];
+
+      
       
       for(int j = 1; j < DATALENGTH; j++){
         d[i].temperature.avg = d[i].temperature.avg + tempArray[i][j];
@@ -348,31 +408,82 @@ void stat(data d[DHTSENSORS], float (&tempArray)[3][10], float (&humidArray)[3][
   }
 }
 
-void makeJson(data* d){
+float roundto1(float f){
+  f = f*10;
+  f = round(f);
+  
+  return f/10;
+}
+
+void makeJson(data d[DHTSENSORS]){
   for(int i = 0; i < DHTSENSORS; i++){
     if(dhtActive[i]){
-      doc[i]["t"]["a"] = d->temperature.avg;
-      doc[i]["t"]["ma"] = d->temperature.max;
-      doc[i]["t"]["mi"] = d->temperature.min;
-      doc[i]["h"]["a"] = d->humidity.avg;
-      doc[i]["h"]["ma"] = d->humidity.max;
-      doc[i]["h"]["mi"] = d->humidity.min;
+      doc[i]["t"]["a"] = roundto1(d[i].temperature.avg);
+      doc[i]["t"]["ma"] = roundto1(d[i].temperature.max);
+      doc[i]["t"]["mi"] = roundto1(d[i].temperature.min);
+      doc[i]["h"]["a"] = roundto1(d[i].humidity.avg);
+      doc[i]["h"]["ma"] = roundto1(d[i].humidity.max);
+      doc[i]["h"]["mi"] = roundto1(d[i].humidity.min);
     }
     else{
       doc[i] = serialized("{}");
     }
   }
-  serializeJson(doc,outputBuffer,256);
+  serializeJson(doc,outputBuffer,OUTPUTBUFFERSIZE);
+}
+
+void publishErrorMessage(char* str){
+  sprintf(outputBuffer, "{\"error\": \"%s\"}", str);
+  publish((char*)"diag", false);
 }
 
 void publish(char* subtopic){
-  topic.toCharArray(topic_c,128);
-  sprintf(topic_c, "%s/%s", topic.c_str(), subtopic);
-  mqttClient.publish(topic_c, outputBuffer);
+  publish(subtopic,true);
 }
 
-double getMemUsage(){
-  return (double)ESP.getFreeHeap()/(double)ESP.getHeapSize();
+void publish(char* subtopic, bool sendError){
+  topic.toCharArray(topic_c,128);
+  sprintf(topic_c, "%s/%s", topic.c_str(), subtopic);
+
+  if(mqttClient.publish(topic_c, outputBuffer)){
+    Serial.println("Published");
+  }
+  else
+  {
+    Serial.println("Failed to publish");
+    publishErrorMessage((char*)"Failed to publish mqtt message.");
+  }
+}
+
+bool readSensors(){
+  bool result = true;
+  long now = millis();
+  for(int i = 0; i < DHTSENSORS; i++){ 
+    if(dhtFailedRead[i]){
+      temp[i][dataIndex] = dht[i].readTemperature();
+      humid[i][dataIndex] = dht[i].readHumidity();
+      
+      if(isnan(temp[i][dataIndex])){
+        result = false;
+        dhtFailedRead[i] = true;
+        dhtReReadTime = now + 3000; // re read after 3sec
+      }
+    }
+  }
+  return result;
+}
+
+void checkReadFailure(){
+  for(int i = 0; i < DHTSENSORS; i++){
+    if(dhtActive[i]){
+      if(isnan(temp[i][dataIndex])){
+        failedReads++;
+        sprintf(outputBuffer, "{\"error\": \"Sensor %i read error.\"}",i);
+        publish((char*)"diag");
+        Serial.printf("failedReads: %i\n", failedReads);
+      }
+    }
+  }
 }
 
 void loop() {
@@ -393,13 +504,28 @@ void loop() {
         }
       }
       else{
-        if (now - lastDataSendEvent > 5000) {
-          lastDataSendEvent = now;
-          
-          for(int i = 0; i < DHTSENSORS; i++){
-            temp[i][dataIndex] = dht[i].readTemperature();
-            humid[i][dataIndex] = dht[i].readHumidity();
+
+        // try to re-read sensor if failed
+        if(dhtReReadTime > 0 && now > dhtReReadTime){
+          dhtReReadTime = 0;
+          if(readSensors()){
+            sprintf(outputBuffer, "{\"info\": \"Sensor re-reading successful.\"}");
           }
+          else{
+            sprintf(outputBuffer, "{\"error\": \"Sensor re-reading failed.\"}");
+          }
+          
+          publish((char*)"diag");
+        }
+
+        // read sensors and send data
+        if (now - lastDataReadEvent > (interval * 1000) / DATALENGTH ) {
+          lastDataReadEvent = now;
+          
+          if(readSensors()){
+            checkReadFailure();
+          }
+
           dataIndex++;
           if(dataIndex >= DATALENGTH){
             Serial.println("Data index reset");
@@ -410,6 +536,7 @@ void loop() {
             makeJson(d);
 
             publish((char*)"data");
+            delay(1000);
 
             sprintf(outputBuffer, "{\"rssi\": %d,\"heap\": %f, \"temp\": %f}", WiFi.RSSI(),getMemUsage(), temperatureRead());
             publish((char*)"diag");
@@ -417,5 +544,13 @@ void loop() {
         }
       }
     }
+  }
+
+  if(failedReads >= 30){
+    sprintf(outputBuffer, "{\"error\": \"Sensor read error (failedReads: %i), restarting...\"}",failedReads);
+    publish((char*)"diag");
+    Serial.println("Restarting because of reading errors...");
+    delay(1000);
+    ESP.restart();
   }
 }

@@ -3,6 +3,11 @@ const char *header =
 Content-type:text/html\n\
 Connection: close\n\n";
 
+const char *noContent = 
+"HTTP/1.1 204 OK\n\
+Content-type:text/html\n\
+Connection: close\n\n";
+
 const char *root =
 "<html><body>\
 <form action=\"/submit\" method=\"post\">\
@@ -19,6 +24,8 @@ const char *root =
   <td><input type=\"text\" name=\"mqttuser\" id=\"mqttuser\"></td></tr>\
   <td><label for=\"mqttpass\">MQTT password</label></td>\
   <td><input type=\"text\" name=\"mqttpass\" id=\"mqttpass\"></td></tr>\
+  <td><label for=\"interval\">Data interval</label></td>\
+  <td><input type=\"number\" name=\"interval\" id=\"interval\"></td></tr>\
 </tbody></table>\
 <input type=\"submit\" value=\"Submit\">\
 </form>\
