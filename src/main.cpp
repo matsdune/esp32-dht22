@@ -262,7 +262,7 @@ void setup() {
         pinMode(DHTDATAPIN2, INPUT);
         pinMode(DHTDATAPIN3, INPUT);
         
-        /* begin DHT sensors and chec if active */
+        /* begin DHT sensors and check if active */
         for (int i = 0; i < DHTSENSORS; i++)
         {
           dht[i].begin();
@@ -455,11 +455,11 @@ void publish(char* subtopic, bool sendError){
   }
 }
 
-bool readSensors(){
+bool readSensors(bool readAll = true){
   bool result = true;
   long now = millis();
   for(int i = 0; i < DHTSENSORS; i++){ 
-    if(dhtFailedRead[i]){
+    if(dhtActive[i] && (dhtFailedRead[i] || readAll)){
       temp[i][dataIndex] = dht[i].readTemperature();
       humid[i][dataIndex] = dht[i].readHumidity();
       
@@ -508,7 +508,7 @@ void loop() {
         // try to re-read sensor if failed
         if(dhtReReadTime > 0 && now > dhtReReadTime){
           dhtReReadTime = 0;
-          if(readSensors()){
+          if(readSensors(false)){
             sprintf(outputBuffer, "{\"info\": \"Sensor re-reading successful.\"}");
           }
           else{
