@@ -41,6 +41,7 @@ String topic = "";
 String mqttuser = "";
 String mqttpass = "";
 int interval = 5;   // data transmission intervall, in seconds
+int sensors = 3;   // number of connected sensors
 #define OUTPUTBUFFERSIZE 256
 char outputBuffer[OUTPUTBUFFERSIZE];
 
@@ -59,14 +60,20 @@ int dataIndex = 0;
 #define DHTDATAPIN2 19
 #define DHTDATAPIN3 21
 
+// ESP AP mode settings
 const char *APssid = "ESP32AP1";
 const char *APpwd = "esp32ap1";
 
+// MQTT
 char server_c[64] = "";
 char topic_c[128] = "";
 int port = 1883;
+
+// TIMING
 long lastReconnectAttempt = 0;
 long lastDataReadEvent = 0;
+#define SENSORCHECKINTERVALL 60000
+long lastSensorCheckEvent = SENSORCHECKINTERVALL;
 
 
 WiFiServer httpserver(80);
@@ -122,6 +129,15 @@ void readMemory(){
   }
   address = address + sizeof interval;
   Serial.println(interval);
+
+  Serial.print("Sensors: ");
+  sensors = EEPROM.readInt(address);
+  if(sensors < 0){
+    sensors = 3;
+  }
+  address = address + sizeof sensors;
+  Serial.println(sensors);
+
   Serial.println();
 }
 
@@ -191,6 +207,7 @@ void writeMemory(String *req){
   String _mqttuser = getFormParam("mqttuser", req);
   String _mqttpass = getFormParam("mqttpass", req);
   int _interval = getFormParam("interval", req).toInt();
+  int _sensors = getFormParam("sensors", req).toInt();
 
   //save to flash
   int address = 0;
@@ -203,6 +220,7 @@ void writeMemory(String *req){
   write = writeToFlash(&address, &_mqttuser, &mqttuser, write);
   write = writeToFlash(&address, &_mqttpass, &mqttpass, write);
   write = writeToFlash(&address, &_interval, &interval, write);
+  write = writeToFlash(&address, &_sensors, &sensors, write);
   
   Serial.printf("max Address: %i\n", address);
 
@@ -215,6 +233,7 @@ void writeMemory(String *req){
   Serial.printf("mqtt user: %s\n",_mqttuser.c_str());
   Serial.printf("mqtt pass: %s\n",_mqttpass.c_str());
   Serial.printf("interval: %i\n",_interval);
+  Serial.printf("sensors: %i\n",_sensors);
 }
 
 void setup() {
@@ -263,7 +282,7 @@ void setup() {
         pinMode(DHTDATAPIN3, INPUT);
         
         /* begin DHT sensors and check if active */
-        for (int i = 0; i < DHTSENSORS; i++)
+        for (int i = 0; i < sensors; i++)
         {
           dht[i].begin();
           if(!isnan(dht[i].readTemperature())){
@@ -274,7 +293,7 @@ void setup() {
         }
 
         if(mqttClient.connected()){
-          sprintf(outputBuffer, "{\"info\": \"Device startup, sensor status:  1: %s, 2: %s, 3: %s\"}", dhtActive[0] ? "ok" : "n/c", dhtActive[1] ? "ok" : "n/c",dhtActive[2] ? "ok" : "n/c");
+          sprintf(outputBuffer, "{\"info\": \"Device startup, number of sensors set to: %i, sensor status:  1: %s, 2: %s, 3: %s\"}", sensors, dhtActive[0] ? "ok" : "n/c", dhtActive[1] ? "ok" : "n/c",dhtActive[2] ? "ok" : "n/c");
           publish((char*)"diag");
         }
         i = 15;
@@ -322,24 +341,21 @@ void handleHttpClient(WiFiClient* client){
         Serial.println(req);
         if(req.substring(0, 6) == "GET / "){
           Serial.println("requested root");
-
-          client->print(header);
-          client->print(root);
+          renderPage(client, "root");
         }
         else if(req.substring(0, 12) == "GET /signal "){
-          client->print(header);
+          renderPage(client);
           client->print(WiFi.RSSI());
           Serial.println(WiFi.RSSI());
         }
         else if(req.substring(0, 13) == "GET /restart "){
-          client->print(noContent);
+          renderPage(client, "noContent");
           ESP.restart();
         }
         else if(req.substring(0, 13) == "POST /submit "){
           Serial.println("requested submit");
 
-          client->print(header);
-          client->print(root);
+          renderPage(client, "root");
 
           writeMemory(&req);
 
@@ -416,7 +432,7 @@ float roundto1(float f){
 }
 
 void makeJson(data d[DHTSENSORS]){
-  for(int i = 0; i < DHTSENSORS; i++){
+  for(int i = 0; i < sensors; i++){
     if(dhtActive[i]){
       doc[i]["t"]["a"] = roundto1(d[i].temperature.avg);
       doc[i]["t"]["ma"] = roundto1(d[i].temperature.max);
@@ -458,7 +474,7 @@ void publish(char* subtopic, bool sendError){
 bool readSensors(bool readAll = true){
   bool result = true;
   long now = millis();
-  for(int i = 0; i < DHTSENSORS; i++){ 
+  for(int i = 0; i < sensors; i++){ 
     if(dhtActive[i] && (dhtFailedRead[i] || readAll)){
       temp[i][dataIndex] = dht[i].readTemperature();
       humid[i][dataIndex] = dht[i].readHumidity();
@@ -474,7 +490,7 @@ bool readSensors(bool readAll = true){
 }
 
 void checkReadFailure(){
-  for(int i = 0; i < DHTSENSORS; i++){
+  for(int i = 0; i < sensors; i++){
     if(dhtActive[i]){
       if(isnan(temp[i][dataIndex])){
         failedReads++;
@@ -482,6 +498,19 @@ void checkReadFailure(){
         publish((char*)"diag");
         Serial.printf("failedReads: %i\n", failedReads);
       }
+    }
+  }
+}
+
+void checkSensorStatus(){
+  for(int i = 0; i < sensors; i++){
+    if(!dhtActive[i]){
+      sprintf(outputBuffer, "{\"error\": \"Sensor check failed (sensor: %i not active), restarting...\"}",i+1);
+      publish((char*)"diag");
+
+      Serial.println("Restarting because sensor is offline...");
+      delay(1000);
+      ESP.restart();
     }
   }
 }
@@ -541,6 +570,12 @@ void loop() {
             sprintf(outputBuffer, "{\"rssi\": %d,\"heap\": %f, \"temp\": %f}", WiFi.RSSI(),getMemUsage(), temperatureRead());
             publish((char*)"diag");
           }
+
+        }
+
+        if (now > lastSensorCheckEvent){
+          lastSensorCheckEvent = now + SENSORCHECKINTERVALL;
+          checkSensorStatus();
         }
       }
     }
